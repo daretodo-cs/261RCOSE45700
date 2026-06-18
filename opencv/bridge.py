@@ -260,41 +260,58 @@ class BodySwayDetector:
 #  얼굴 모자이크 + 위험 스크린샷 저장
 # ═══════════════════════════════════════════════════════════════
 
-def apply_face_mosaic(frame, face_detector, mosaic_scale=0.05):
-    """프레임의 모든 얼굴 영역에 픽셀 모자이크를 적용한 복사본 반환."""
-    if face_detector is None:
-        return frame.copy()
+def apply_face_mosaic(frame, face_detector, mosaic_scale=0.05,
+                      fallback_regions=None, pad_ratio=0.25):
+    """프레임의 모든 얼굴 영역에 픽셀 모자이크를 적용한 복사본 반환.
+
+    땀 닦기처럼 손/수건이 얼굴을 가린 프레임에서는 얼굴 감지가 실패해 모자이크가
+    하나도 안 칠해질 수 있다. 이를 막기 위해 감지가 실패하면 fallback_regions
+    (직전에 감지된 얼굴 위치 [(x, y, w, h), ...])에 모자이크를 적용한다.
+    가려진 동안 얼굴이 움직였을 수 있으므로 pad_ratio만큼 영역을 넓혀서 칠한다.
+    """
+    result         = frame.copy()
     fh_img, fw_img = frame.shape[:2]
-    rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
-    res    = face_detector.detect(mp_img)
-    result = frame.copy()
-    if res.detections:
-        for det in res.detections:
-            bb = det.bounding_box
-            x1 = max(0, bb.origin_x)
-            y1 = max(0, bb.origin_y)
-            x2 = min(fw_img, bb.origin_x + bb.width)
-            y2 = min(fh_img, bb.origin_y + bb.height)
-            if x2 <= x1 or y2 <= y1:
-                continue
-            roi     = result[y1:y2, x1:x2]
-            rh, rw  = roi.shape[:2]
-            small_w = max(1, int(rw * mosaic_scale))
-            small_h = max(1, int(rh * mosaic_scale))
-            small   = cv2.resize(roi, (small_w, small_h))
-            mosaic  = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)
-            result[y1:y2, x1:x2] = mosaic
+
+    regions: list[tuple[int, int, int, int]] = []
+    if face_detector is not None:
+        rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
+        res    = face_detector.detect(mp_img)
+        if res.detections:
+            regions = [(d.bounding_box.origin_x, d.bounding_box.origin_y,
+                        d.bounding_box.width, d.bounding_box.height)
+                       for d in res.detections]
+
+    # 감지 실패(예: 땀 닦는 손에 얼굴이 가려짐) 시 직전 얼굴 위치로 폴백 → 얼굴 노출 방지
+    if not regions and fallback_regions:
+        regions = list(fallback_regions)
+
+    for (ox, oy, w, h) in regions:
+        px = int(w * pad_ratio)
+        py = int(h * pad_ratio)
+        x1 = max(0, ox - px)
+        y1 = max(0, oy - py)
+        x2 = min(fw_img, ox + w + px)
+        y2 = min(fh_img, oy + h + py)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        roi     = result[y1:y2, x1:x2]
+        rh, rw  = roi.shape[:2]
+        small_w = max(1, int(rw * mosaic_scale))
+        small_h = max(1, int(rh * mosaic_scale))
+        small   = cv2.resize(roi, (small_w, small_h))
+        mosaic  = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)
+        result[y1:y2, x1:x2] = mosaic
     return result
 
 
-def save_danger_screenshots(frames, face_detector) -> list[str]:
+def save_danger_screenshots(frames, face_detector, fallback_regions=None) -> list[str]:
     """위험 감지 프레임들을 얼굴 모자이크 처리 후 JPEG로 저장. 경로 목록 반환."""
     from datetime import datetime
     timestamp   = datetime.now().strftime('%Y%m%d_%H%M%S')
     saved_paths = []
     for i, frame in enumerate(frames):
-        mosaiced = apply_face_mosaic(frame, face_detector)
+        mosaiced = apply_face_mosaic(frame, face_detector, fallback_regions=fallback_regions)
         path     = os.path.join(DANGER_SCREENSHOT_DIR, f'danger_{timestamp}_{i + 1}.jpg')
         cv2.imwrite(path, mosaiced)
         saved_paths.append(path)
@@ -749,7 +766,9 @@ def _run_detection_loop(
                     if sway_status == 'ready' and not danger_state['pending']:
                         captured    = sway_detector.get_captured_frames()
                         sway_detector.reset_capture()
-                        saved_paths = save_danger_screenshots(captured, face_detector_image)
+                        fallback = [last_face_region] if last_face_region else None
+                        saved_paths = save_danger_screenshots(
+                            captured, face_detector_image, fallback_regions=fallback)
                         if saved_paths:
                             danger_state['pending'] = True
                             threading.Thread(
@@ -882,7 +901,11 @@ def _run_detection_loop(
                         f"[{zone_id}][DATA][BRIDGE->STATE] "
                         "sending 4-frame batch for VLM confirmation"
                     )
-                mosaiced_batch = [apply_face_mosaic(f, face_detector_image) for f in frame_buffer]
+                fallback = [last_face_region] if last_face_region else None
+                mosaiced_batch = [
+                    apply_face_mosaic(f, face_detector_image, fallback_regions=fallback)
+                    for f in frame_buffer
+                ]
                 asyncio.run_coroutine_threadsafe(
                     _put_nowait(frame_queue, mosaiced_batch), loop
                 )
